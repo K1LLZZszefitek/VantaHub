@@ -1,0 +1,15 @@
+{
+  "name": "vanta-hub",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-session": "^1.18.1",
+    "multer": "^2.0.0",
+    "discord.js": "^14.22.1"
+  }
+}
