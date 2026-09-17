@@ -112,13 +112,42 @@ app.get("/api/site",(q,s)=>{const c={...defaults,...read(CONTENT,{})};c.catalog=
 
 app.get("/api/admin/media/preview",needAdmin,async(q,s)=>{
  try{
-  const url=String(q.query.url||"").trim(); if(!/^https?:\/\//i.test(url))return s.status(400).json({error:"Nieprawidłowy link."});
-  let thumbnail="";
-  const yt=url.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|embed\/))([A-Za-z0-9_-]{6,})/i);
-  if(yt)thumbnail=`https://i.ytimg.com/vi/${yt[1]}/hqdefault.jpg`;
-  else if(/tiktok\.com/i.test(url)){const r=await fetch("https://www.tiktok.com/oembed?url="+encodeURIComponent(url),{headers:{"User-Agent":"Mozilla/5.0 VANTA-HUB"}});if(r.ok){const x=await r.json();thumbnail=String(x.thumbnail_url||"")}}
-  s.json({ok:true,thumbnail});
- }catch(e){s.json({ok:true,thumbnail:""})}
+   let url=String(q.query.url||"").trim();
+   if(!/^https?:\/\//i.test(url))return s.status(400).json({error:"Nieprawidłowy link."});
+   let thumbnail="";
+
+   // YouTube: works for watch, shorts, embed and youtu.be.
+   const yt=url.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:[^#]*&)?v=|shorts\/|embed\/))([A-Za-z0-9_-]{6,})/i);
+   if(yt)thumbnail=`https://i.ytimg.com/vi/${yt[1]}/maxresdefault.jpg`;
+
+   if(!thumbnail && /tiktok\.com/i.test(url)){
+     // TikTok share links (vm/vt) first need to be resolved to the final video URL.
+     try{
+       const rr=await fetch(url,{method:"GET",redirect:"follow",headers:{"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36","Accept-Language":"pl-PL,pl;q=0.9,en;q=0.8"}});
+       if(rr.url && /tiktok\.com/i.test(rr.url))url=rr.url;
+       const page=await rr.text().catch(()=>"");
+       const og=page.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
+             || page.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i);
+       if(og?.[1])thumbnail=og[1].replace(/&amp;/g,"&");
+     }catch{}
+
+     // Official TikTok oEmbed is preferred when available.
+     try{
+       const r=await fetch("https://www.tiktok.com/oembed?url="+encodeURIComponent(url),{
+         headers:{"User-Agent":"Mozilla/5.0 VANTA-HUB","Accept":"application/json"}
+       });
+       if(r.ok){
+         const x=await r.json();
+         if(x?.thumbnail_url)thumbnail=String(x.thumbnail_url);
+       }
+     }catch{}
+   }
+
+   s.json({ok:true,thumbnail,url});
+ }catch(e){
+   console.error("[VANTA MEDIA PREVIEW]",e.message);
+   s.json({ok:true,thumbnail:""});
+ }
 });
 
 async function forumThreads(fid){
