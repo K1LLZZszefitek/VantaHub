@@ -2,6 +2,7 @@ require("dotenv").config();
 const express=require("express"), session=require("express-session"), multer=require("multer");
 const {Client,GatewayIntentBits,REST,Routes,SlashCommandBuilder,PermissionFlagsBits,ChannelType,ActionRowBuilder,ButtonBuilder,ButtonStyle}=require("discord.js");
 const fs=require("fs"), path=require("path");
+const {Pool}=require("pg");
 const app=express(), PORT=Number(process.env.PORT||3000), API="https://discord.com/api/v10";
 const GUILD=process.env.DISCORD_GUILD_ID||"1492598542764867744";
 const CATEGORY=process.env.TICKET_CATEGORY_ID||"1492658451413860462";
@@ -18,11 +19,44 @@ const defaults={site:{about:"Premium FiveM assets & custom work.",contact:"Skont
 if(!fs.existsSync(ORD))fs.writeFileSync(ORD,"[]");
 if(!fs.existsSync(CONTENT))fs.writeFileSync(CONTENT,JSON.stringify(defaults,null,2));
 if(!fs.existsSync(STATS))fs.writeFileSync(STATS,JSON.stringify({pageViews:0,visitors:[],daily:{}},null,2));
-const read=(f,d)=>{try{return JSON.parse(fs.readFileSync(f,"utf8"))}catch{return d}};
-const write=(f,v)=>fs.writeFileSync(f,JSON.stringify(v,null,2));
+// Persistent storage: PostgreSQL when DATABASE_URL is configured, local JSON as fallback/cache.
+const dbCache=new Map();
+let dbPool=null, dbReady=false;
+const dbKey=f=>path.basename(f).toLowerCase();
+const read=(f,d)=>{
+ const k=dbKey(f);
+ if(dbCache.has(k))return dbCache.get(k);
+ try{return JSON.parse(fs.readFileSync(f,"utf8"))}catch{return d}
+};
+const persistDb=(k,v)=>{
+ if(!dbReady||!dbPool)return;
+ dbPool.query(`INSERT INTO vanta_store(key,data,updated_at) VALUES($1,$2::jsonb,NOW()) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,updated_at=NOW()`,[k,JSON.stringify(v)])
+   .catch(e=>console.error("[VANTA DB WRITE]",k,e.message));
+};
+const write=(f,v)=>{
+ const k=dbKey(f); dbCache.set(k,v);
+ try{fs.writeFileSync(f,JSON.stringify(v,null,2))}catch(e){console.error("[VANTA LOCAL WRITE]",e.message)}
+ persistDb(k,v);
+};
+async function initPersistentStore(){
+ const url=String(process.env.DATABASE_URL||"").trim();
+ if(!url){console.warn("[VANTA DB] Brak DATABASE_URL — dane działają lokalnie, ale nie są trwałe po redeployu.");return}
+ try{
+  dbPool=new Pool({connectionString:url,ssl:process.env.DB_SSL==="false"?false:{rejectUnauthorized:false}});
+  await dbPool.query(`CREATE TABLE IF NOT EXISTS vanta_store (key TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  const files=[ORD,CONTENT,STATS,path.join(DATA,"v25.json")];
+  for(const f of files){
+   const k=dbKey(f),r=await dbPool.query(`SELECT data FROM vanta_store WHERE key=$1`,[k]);
+   if(r.rows.length){dbCache.set(k,r.rows[0].data);try{fs.writeFileSync(f,JSON.stringify(r.rows[0].data,null,2))}catch{}}
+   else{let local;try{local=JSON.parse(fs.readFileSync(f,"utf8"))}catch{local=k==="orders.json"?[]:{}};dbCache.set(k,local);await dbPool.query(`INSERT INTO vanta_store(key,data) VALUES($1,$2::jsonb) ON CONFLICT DO NOTHING`,[k,JSON.stringify(local)])}
+  }
+  dbReady=true; console.log("[VANTA DB] PostgreSQL ONLINE — dane trwałe.");
+ }catch(e){console.error("[VANTA DB] Błąd połączenia:",e.message);dbPool=null;dbReady=false}
+}
 const upload=multer({dest:UP,limits:{fileSize:15*1024*1024,files:10}});
 app.use(express.json({limit:"2mb"}));
-app.use(session({secret:process.env.SESSION_SECRET||"CHANGE_THIS_SESSION_SECRET",resave:false,saveUninitialized:false,cookie:{httpOnly:true,sameSite:"lax",maxAge:7*864e5}}));
+app.set("trust proxy",1);
+app.use(session({secret:process.env.SESSION_SECRET||"CHANGE_THIS_SESSION_SECRET",resave:false,saveUninitialized:false,cookie:{httpOnly:true,secure:"auto",sameSite:"lax",maxAge:7*864e5}}));
 app.get("/vanta-logo.png",(q,s)=>s.sendFile(path.join(ROOT,"vanta-logo.png")));
 
 async function discord(url,opt={}){
@@ -75,6 +109,17 @@ app.get("/auth/discord/callback",async(q,s)=>{
 });
 app.get("/api/me",(q,s)=>{const j=!!q.session.justLoggedIn;q.session.justLoggedIn=false;s.json({loggedIn:!!q.session.user,user:q.session.user||null,admin:admin(q),justLoggedIn:j})});
 app.get("/api/site",(q,s)=>{const c={...defaults,...read(CONTENT,{})};c.catalog={...FORUMS,...(c.catalog||{})};c.realizations=Array.isArray(c.realizations)?c.realizations:[];c.reviews=Array.isArray(c.reviews)?c.reviews:[];c.announcement=c.announcement||{enabled:false,text:""};s.json(c)});
+
+app.get("/api/admin/media/preview",needAdmin,async(q,s)=>{
+ try{
+  const url=String(q.query.url||"").trim(); if(!/^https?:\/\//i.test(url))return s.status(400).json({error:"Nieprawidłowy link."});
+  let thumbnail="";
+  const yt=url.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|embed\/))([A-Za-z0-9_-]{6,})/i);
+  if(yt)thumbnail=`https://i.ytimg.com/vi/${yt[1]}/hqdefault.jpg`;
+  else if(/tiktok\.com/i.test(url)){const r=await fetch("https://www.tiktok.com/oembed?url="+encodeURIComponent(url),{headers:{"User-Agent":"Mozilla/5.0 VANTA-HUB"}});if(r.ok){const x=await r.json();thumbnail=String(x.thumbnail_url||"")}}
+  s.json({ok:true,thumbnail});
+ }catch(e){s.json({ok:true,thumbnail:""})}
+});
 
 async function forumThreads(fid){
  const all=[]; try{const a=await discord(`/guilds/${GUILD}/threads/active`);all.push(...(a.threads||[]))}catch{}
@@ -561,4 +606,4 @@ app.get("/api/discord/avatar",async(q,res)=>{
  }catch(e){res.status(404).end()}
 });
 
-app.listen(PORT,()=>console.log("VANTA HUB: http://localhost:"+PORT));
+initPersistentStore().finally(()=>app.listen(PORT,()=>console.log("VANTA HUB ONLINE • PORT "+PORT)));
